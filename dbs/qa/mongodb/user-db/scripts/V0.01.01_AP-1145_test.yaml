@@ -1,0 +1,11 @@
+databaseChangeLog:
+- changeSet:
+      id: V0.01.01:AP-1145:test
+      author: aryan.jaiswal
+      context: user-db
+      labels: pre
+      comment: AP-1145:nothing, just playing
+      changes:
+        - runCommand:
+            command: |
+              { "create": "candidate" }
