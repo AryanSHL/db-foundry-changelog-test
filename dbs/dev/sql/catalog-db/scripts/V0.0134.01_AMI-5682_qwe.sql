@@ -4,3 +4,4 @@
 --comment: AMI-5682:adsf
 
 update employee set id =1 where id=2;
+update employee set id =4 where id=3;
