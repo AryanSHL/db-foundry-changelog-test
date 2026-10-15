@@ -1,0 +1,463 @@
+name: PR Validate
+
+# =============================================================================
+# Runs `liquibase validate` on the target EC2 (via SSM) when a PR is raised
+# or when the PR enters the merge queue.
+#
+# Auto-detects the target environment from changed file paths under dbs/<env>/.
+#
+# Triggers:
+#   - pull_request  : runs on PR open / new push / reopen
+#   - merge_group   : runs when PR enters GitHub Merge Queue (pre-merge check)
+#   - workflow_dispatch : manual runs
+#
+# Concurrency:
+#   Per-PR group with cancel-in-progress: true. If a new push arrives on the
+#   same PR, the stale run is cancelled immediately (no wasted runners).
+#   Different PRs get different groups so they don't block each other.
+#   The merge queue handles cross-PR serialization — it only sends one PR
+#   at a time for merge checks, so EC2 collisions are avoided.
+# =============================================================================
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+  merge_group:
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+          - stg
+          - uat
+          - prod
+
+      region:
+        description: 'Region (PROD only): AU | EU | US | CH'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - AU
+          - EU
+          - US
+          - CH
+
+      source_branch:
+        description: 'Source branch (manual run only)'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: pr-validate-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: liquibase validate (${{ inputs.environment || 'auto-detect' }})
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+      statuses: write
+      pull-requests: read
+
+    steps:
+
+      # ── Checkout source branch ────────────────────────────────
+      - name: Checkout Source Branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_branch || github.head_ref || github.ref }}
+          fetch-depth: 0
+
+      # ── Resolve environment + region from changed files ───────
+      - name: Resolve Environment & Region
+        env:
+          GH_EVENT: ${{ github.event_name }}
+          GH_INPUT_ENV: ${{ inputs.environment }}
+          GH_INPUT_REGION: ${{ inputs.region }}
+          GH_BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [[ "$GH_EVENT" == "workflow_dispatch" ]]; then
+            SELECTED_ENV="$GH_INPUT_ENV"
+            SELECTED_REGION="$GH_INPUT_REGION"
+            echo "Manual run — ENV=$SELECTED_ENV REGION=${SELECTED_REGION:-<none>}"
+          else
+            TARGET="${GH_BASE_REF:-master}"
+            git fetch origin "$TARGET"
+            CHANGED=$(git diff --name-only "origin/$TARGET"...HEAD)
+            echo "Changed files:"; echo "$CHANGED"
+
+            ENVS=$(echo "$CHANGED" | grep -oP '^dbs/\K[^/]+' | sort -u)
+            ENV_COUNT=$(echo "$ENVS" | grep -c . || true)
+
+            if [[ $ENV_COUNT -eq 0 ]]; then
+              echo "No dbs/ changes detected — skipping validate."
+              echo "SKIP_VALIDATE=true" >> $GITHUB_ENV
+              exit 0
+            fi
+            if [[ $ENV_COUNT -gt 1 ]]; then
+              echo "ERROR: Multiple environments detected in one PR: $ENVS"
+              echo "A PR should only change files under one environment."
+              exit 1
+            fi
+
+            SELECTED_ENV=$(echo "$ENVS" | tr -d '[:space:]')
+            SELECTED_REGION=""
+
+            if [[ "$SELECTED_ENV" == "prod" ]]; then
+              SELECTED_REGION=$(echo "$CHANGED" | grep -oP '^dbs/prod/\K[^/]+' | sort -u | head -n1)
+              if [[ -z "$SELECTED_REGION" ]]; then
+                echo "ERROR: prod changes must be under dbs/prod/<REGION>/"
+                exit 1
+              fi
+            fi
+          fi
+
+          case "$SELECTED_ENV" in
+            dev|qa|stg|uat|prod) ;;
+            *) echo "ERROR: env '$SELECTED_ENV' is not valid. Allowed: dev, qa, stg, uat, prod"; exit 1 ;;
+          esac
+
+          echo "SELECTED_ENV=$SELECTED_ENV"       >> $GITHUB_ENV
+          echo "SELECTED_REGION=$SELECTED_REGION" >> $GITHUB_ENV
+
+      # ── Exit early if no dbs/ changes ─────────────────────────
+      - name: Check skip
+        if: env.SKIP_VALIDATE == 'true'
+        run: echo "No dbs/ changes — nothing to validate."
+
+      # ── Set AWS config per environment ────────────────────────
+      - name: Set Config
+        if: env.SKIP_VALIDATE != 'true'
+        env:
+          SECRET_DEV_ROLE: ${{ secrets.AWS_ROLE_ARN_TCP_DEV }}
+          SECRET_QA_ROLE: ${{ secrets.AWS_ROLE_ARN_TCP_QA }}
+          SECRET_STG_ROLE: ${{ secrets.AWS_ROLE_ARN_TCP_STG }}
+          SECRET_UAT_ROLE: ${{ secrets.AWS_ROLE_ARN_TCP_UAT }}
+          SECRET_PROD_ROLE: ${{ secrets.AWS_ROLE_ARN_TCP_PROD }}
+          SECRET_ASG: ${{ secrets.ASG_NAME }}
+        run: |
+          case "$SELECTED_ENV" in
+            dev)
+              echo "AWS_REGION=us-east-1"                        >> $GITHUB_ENV
+              echo "ASG_NAME=$SECRET_ASG"                        >> $GITHUB_ENV
+              echo "APPCONFIG_APP=tcplusdev-db-migration-github" >> $GITHUB_ENV
+              echo "APPCONFIG_ENV=dev"                           >> $GITHUB_ENV
+              echo "ROLE_ARN=$SECRET_DEV_ROLE"                   >> $GITHUB_ENV
+              ;;
+            qa)
+              echo "AWS_REGION=us-east-1"                        >> $GITHUB_ENV
+              echo "ASG_NAME=$SECRET_ASG"                        >> $GITHUB_ENV
+              echo "APPCONFIG_APP=tcplusdev-db-migration-github" >> $GITHUB_ENV
+              echo "APPCONFIG_ENV=qa"                            >> $GITHUB_ENV
+              echo "ROLE_ARN=$SECRET_QA_ROLE"                    >> $GITHUB_ENV
+              ;;
+            stg)
+              echo "AWS_REGION=us-east-1"                        >> $GITHUB_ENV
+              echo "ASG_NAME=$SECRET_ASG"                        >> $GITHUB_ENV
+              echo "APPCONFIG_APP=tcplusstg-db-migration"        >> $GITHUB_ENV
+              echo "APPCONFIG_ENV=stg"                           >> $GITHUB_ENV
+              echo "ROLE_ARN=$SECRET_STG_ROLE"                   >> $GITHUB_ENV
+              ;;
+            uat)
+              echo "AWS_REGION=us-east-1"                        >> $GITHUB_ENV
+              echo "ASG_NAME=$SECRET_ASG"                        >> $GITHUB_ENV
+              echo "APPCONFIG_APP=tcp-uat-db-migration"          >> $GITHUB_ENV
+              echo "APPCONFIG_ENV=uat"                           >> $GITHUB_ENV
+              echo "ROLE_ARN=$SECRET_UAT_ROLE"                   >> $GITHUB_ENV
+              ;;
+            prod)
+              case "$SELECTED_REGION" in
+                US) AWS_R=us-east-1      ;;
+                EU) AWS_R=eu-central-1   ;;
+                AU) AWS_R=ap-southeast-2 ;;
+                CH) AWS_R=cn-north-1     ;;
+                *)  echo "ERROR: invalid region '$SELECTED_REGION'"; exit 1 ;;
+              esac
+              echo "AWS_REGION=$AWS_R"                           >> $GITHUB_ENV
+              echo "ASG_NAME=$SECRET_ASG"                        >> $GITHUB_ENV
+              echo "APPCONFIG_APP=tcp-${SELECTED_REGION,,}-prod-db-migration" >> $GITHUB_ENV
+              echo "APPCONFIG_ENV=${SELECTED_REGION,,}"          >> $GITHUB_ENV
+              echo "ROLE_ARN=$SECRET_PROD_ROLE"                  >> $GITHUB_ENV
+              ;;
+            *) echo "ERROR: no config for env '$SELECTED_ENV'"; exit 1 ;;
+          esac
+
+      # ── Configure AWS credentials ─────────────────────────────
+      - name: Configure AWS credentials
+        if: env.SKIP_VALIDATE != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Scale UP ASG ──────────────────────────────────────────
+      - name: Scale Up ASG (0 → 1)
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          echo "Scaling up ASG: $ASG_NAME"
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --min-size 1 --desired-capacity 1 --max-size 1 \
+            --region "$AWS_REGION"
+
+      - name: Wait for EC2 Instance
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          MAX_WAIT=300; ELAPSED=0
+          while true; do
+            INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG_NAME" --region "$AWS_REGION" \
+              --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+              --output text)
+            if [[ -n "$INSTANCE_ID" && "$INSTANCE_ID" != "None" ]]; then
+              echo "Instance running: $INSTANCE_ID"
+              echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+              break
+            fi
+            [[ $ELAPSED -ge $MAX_WAIT ]] && { echo "ERROR: Timed out waiting for EC2"; exit 1; }
+            echo "Waiting... ($ELAPSED s)"; sleep 15; ELAPSED=$((ELAPSED + 15))
+          done
+
+      - name: Wait for SSM Agent
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          MAX_WAIT=300; ELAPSED=0
+          while true; do
+            STATUS=$(aws ssm describe-instance-information --region "$AWS_REGION" \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query "InstanceInformationList[0].PingStatus" --output text 2>/dev/null || echo "NotReady")
+            [[ "$STATUS" == "Online" ]] && { echo "SSM Agent Online"; break; }
+            [[ $ELAPSED -ge $MAX_WAIT ]] && { echo "ERROR: Timed out waiting for SSM"; exit 1; }
+            echo "SSM Status: $STATUS ($ELAPSED s)"; sleep 15; ELAPSED=$((ELAPSED + 15))
+          done
+
+      # ── Fetch liquibase.env from AppConfig ────────────────────
+      - name: Fetch liquibase.env from AppConfig
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          mkdir -p env
+          TOKEN=$(aws appconfigdata start-configuration-session \
+            --application-identifier "$APPCONFIG_APP" \
+            --environment-identifier "$APPCONFIG_ENV" \
+            --configuration-profile-identifier liquibase-env \
+            --region "$AWS_REGION" --query InitialConfigurationToken --output text)
+          aws appconfigdata get-latest-configuration \
+            --configuration-token "$TOKEN" --region "$AWS_REGION" env/liquibase.env
+
+      # ── Fetch versions.json from AppConfig ────────────────────
+      - name: Fetch versions.json from AppConfig
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          mkdir -p config
+          TOKEN=$(aws appconfigdata start-configuration-session \
+            --application-identifier "$APPCONFIG_APP" \
+            --environment-identifier "$APPCONFIG_ENV" \
+            --configuration-profile-identifier liquibase-versions \
+            --region "$AWS_REGION" --query InitialConfigurationToken --output text)
+          aws appconfigdata get-latest-configuration \
+            --configuration-token "$TOKEN" --region "$AWS_REGION" config/versions.json
+
+      # ── Set version env vars ──────────────────────────────────
+      - name: Set version env vars
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          LB_VERSION=$(jq -r '.LB_VERSION' config/versions.json)
+          MYSQL_DRIVER_VERSION=$(jq -r '.MYSQL_DRIVER_VERSION' config/versions.json)
+          MONGO_EXT_VERSION=$(jq -r '.MONGO_EXT_VERSION' config/versions.json)
+          MONGO_DRIVER_VERSION=$(jq -r '.MONGO_DRIVER_VERSION' config/versions.json)
+          for var in LB_VERSION MYSQL_DRIVER_VERSION MONGO_EXT_VERSION MONGO_DRIVER_VERSION; do
+            if [[ -z "${!var}" || "${!var}" == "null" ]]; then echo "ERROR: $var missing in versions.json"; exit 1; fi
+          done
+          echo "LB_VERSION=$LB_VERSION"                     >> $GITHUB_ENV
+          echo "MYSQL_DRIVER_VERSION=$MYSQL_DRIVER_VERSION" >> $GITHUB_ENV
+          echo "MONGO_EXT_VERSION=$MONGO_EXT_VERSION"       >> $GITHUB_ENV
+          echo "MONGO_DRIVER_VERSION=$MONGO_DRIVER_VERSION" >> $GITHUB_ENV
+
+      # ── Setup EC2 workspace (clone this repo) ─────────────────
+      - name: Setup EC2 Workspace via SSM
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          SOURCE_BRANCH="${{ inputs.source_branch || github.head_ref || github.ref_name }}"
+          ENV_ENCODED=$(base64 -w 0 env/liquibase.env)
+          GH_TOKEN="${{ secrets.GH_PAT }}"
+
+          SCRIPT=$(cat <<EOF
+          #!/bin/bash
+          set -e
+          mkdir -p /opt/liquibase-runner/env
+          echo "${ENV_ENCODED}" | base64 -d > /opt/liquibase-runner/env/liquibase.env
+
+          cd /opt/liquibase-runner
+          if [ -d "repo/.git" ]; then
+            cd repo
+            git fetch origin
+            git checkout ${SOURCE_BRANCH}
+            git pull origin ${SOURCE_BRANCH}
+          else
+            git clone https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git repo
+            cd repo
+            git checkout ${SOURCE_BRANCH}
+          fi
+          git remote set-url origin https://github.com/${{ github.repository }}.git
+          echo "Workspace ready on branch: ${SOURCE_BRANCH}"
+          EOF
+          )
+
+          ENCODED=$(echo "$SCRIPT" | base64 -w 0)
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"echo $ENCODED | base64 -d | bash\"]" \
+            --region "$AWS_REGION" --query "Command.CommandId" --output text)
+          bash .github/scripts/wait-ssm.sh "$COMMAND_ID" "$INSTANCE_ID" "$AWS_REGION"
+
+      # ── Install Java on EC2 ───────────────────────────────────
+      - name: Install Java on EC2
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          SCRIPT=$(cat <<'EOF'
+          #!/bin/bash
+          set -e
+          if java -version >/dev/null 2>&1; then
+            echo "Java already installed"; java -version
+          else
+            echo "Installing Java 17..."
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -qq && sudo apt-get install -y openjdk-17-jre-headless
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y java-17-amazon-corretto
+            else
+              echo "ERROR: no supported package manager"; exit 1
+            fi
+            java -version
+          fi
+          EOF
+          )
+          ENCODED=$(echo "$SCRIPT" | base64 -w 0)
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"echo $ENCODED | base64 -d | bash\"]" \
+            --region "$AWS_REGION" --query "Command.CommandId" --output text)
+          bash .github/scripts/wait-ssm.sh "$COMMAND_ID" "$INSTANCE_ID" "$AWS_REGION"
+
+      # ── Install Liquibase + drivers on EC2 ────────────────────
+      - name: Install Liquibase on EC2
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          SCRIPT=$(cat <<EOF
+          #!/bin/bash
+          set -e
+          if ! command -v yq &>/dev/null; then
+            wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+              -O /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+          fi
+
+          INSTALL_DIR="/opt/liquibase/${LB_VERSION}"
+          if [ ! -f "\$INSTALL_DIR/liquibase" ]; then
+            sudo mkdir -p "\$INSTALL_DIR/lib"
+            cd /tmp
+            wget -q https://github.com/liquibase/liquibase/releases/download/v${LB_VERSION}/liquibase-${LB_VERSION}.tar.gz
+            tar -xzf liquibase-${LB_VERSION}.tar.gz -C "\$INSTALL_DIR"
+            sudo ln -sf "\$INSTALL_DIR/liquibase" /usr/local/bin/liquibase
+            sudo chmod +x "\$INSTALL_DIR/liquibase"
+          fi
+
+          LIB_DIR="\$INSTALL_DIR/lib"
+          DRIVER="mysql-connector-java-${MYSQL_DRIVER_VERSION}.jar"
+          if [ ! -f "\$LIB_DIR/\$DRIVER" ]; then
+            curl -fL "https://repo1.maven.org/maven2/mysql/mysql-connector-java/${MYSQL_DRIVER_VERSION}/\$DRIVER" \
+              -o "/tmp/\$DRIVER"; sudo mv "/tmp/\$DRIVER" "\$LIB_DIR/"
+          fi
+
+          EXT="liquibase-mongodb-${MONGO_EXT_VERSION}.jar"
+          if [ ! -f "\$LIB_DIR/\$EXT" ]; then
+            curl -fL "https://repo1.maven.org/maven2/org/liquibase/ext/liquibase-mongodb/${MONGO_EXT_VERSION}/\$EXT" \
+              -o "/tmp/\$EXT"; sudo mv "/tmp/\$EXT" "\$LIB_DIR/"
+          fi
+
+          for artifact in mongodb-driver-sync mongodb-driver-core bson; do
+            JAR="\${artifact}-${MONGO_DRIVER_VERSION}.jar"
+            if [ ! -f "\$LIB_DIR/\$JAR" ]; then
+              curl -fL "https://repo1.maven.org/maven2/org/mongodb/\${artifact}/${MONGO_DRIVER_VERSION}/\$JAR" \
+                -o "/tmp/\$JAR"; sudo mv "/tmp/\$JAR" "\$LIB_DIR/"
+            fi
+          done
+
+          sudo chmod 644 \$LIB_DIR/*.jar
+          liquibase --version
+          EOF
+          )
+
+          ENCODED=$(echo "$SCRIPT" | base64 -w 0)
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"echo $ENCODED | base64 -d | bash\"]" \
+            --region "$AWS_REGION" --query "Command.CommandId" --output text)
+          bash .github/scripts/wait-ssm.sh "$COMMAND_ID" "$INSTANCE_ID" "$AWS_REGION"
+
+      # ── Liquibase Validate ────────────────────────────────────
+      - name: Liquibase Validate on EC2
+        if: env.SKIP_VALIDATE != 'true'
+        run: |
+          REGION_ARG="none"
+          if [[ "$SELECTED_ENV" == "prod" ]]; then REGION_ARG="$SELECTED_REGION"; fi
+
+          LB_CMD="bash /opt/liquibase-runner/repo/run-liquibase.sh $SELECTED_ENV validate $REGION_ARG"
+          echo "Running: $LB_CMD"
+
+          SCRIPT=$(cat <<EOF
+          #!/bin/bash
+          set -e
+          sed -i 's/\r//' /opt/liquibase-runner/env/liquibase.env
+          mkdir -p /opt/liquibase-runner/repo/env
+          cp /opt/liquibase-runner/env/liquibase.env /opt/liquibase-runner/repo/env/liquibase.env
+          source /opt/liquibase-runner/env/liquibase.env
+          chmod +x /opt/liquibase-runner/repo/run-liquibase.sh
+          $LB_CMD
+          EOF
+          )
+
+          ENCODED=$(echo "$SCRIPT" | base64 -w 0)
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"echo $ENCODED | base64 -d | bash\"]" \
+            --region "$AWS_REGION" --query "Command.CommandId" --output text)
+          bash .github/scripts/wait-ssm.sh "$COMMAND_ID" "$INSTANCE_ID" "$AWS_REGION"
+
+      # ── Post PR status ────────────────────────────────────────
+      - name: Post PR Status
+        if: always() && github.event_name == 'pull_request' && env.SKIP_VALIDATE != 'true'
+        run: |
+          STATE=$([[ "${{ job.status }}" == "success" ]] && echo "success" || echo "failure")
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{\"state\":\"$STATE\",\"context\":\"liquibase-validate\"}"
+
+      # ── Scale DOWN ASG (always) ───────────────────────────────
+      - name: Scale Down ASG (1 → 0)
+        if: always() && env.SKIP_VALIDATE != 'true'
+        run: |
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --min-size 0 --desired-capacity 0 --max-size 0 \
+            --region "$AWS_REGION"
+          echo "ASG scaled down"
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f env/liquibase.env config/versions.json
