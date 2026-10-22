@@ -1,0 +1,11 @@
+databaseChangeLog:
+- changeSet:
+      id: V0.02.01:AC-1085:gh
+      author: aryan.jaiswal
+      context: communication_service
+      labels: pre
+      comment: AC-1085:ghjkl
+      changes:
+        - runCommand:
+            command: |
+              { "create": "candidate"}
