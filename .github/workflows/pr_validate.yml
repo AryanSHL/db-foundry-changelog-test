@@ -21,7 +21,7 @@ name: PR Validate
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
     types: [opened, synchronize, reopened]
 
   merge_group:
@@ -95,7 +95,7 @@ jobs:
             SELECTED_REGION="$GH_INPUT_REGION"
             echo "Manual run — ENV=$SELECTED_ENV REGION=${SELECTED_REGION:-<none>}"
           else
-            TARGET="${GH_BASE_REF:-master}"
+            TARGET="${GH_BASE_REF:-main}"
             git fetch origin "$TARGET"
             # Rollback trees (dbs/<env>-rollback, dbs/prod/<REGION>-rollback) are never
             # auto-run, so they must not count towards env/region detection.

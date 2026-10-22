@@ -2,7 +2,7 @@ name: Deploy
 
 # =============================================================================
 # Runs `liquibase validate` then `liquibase update` on the target EC2 (via SSM)
-# after a PR is merged to master.
+# after a PR is merged to main.
 #
 # Flow:
 #   Job 1 (validate) : scale up EC2, validate all changesets
@@ -15,7 +15,7 @@ name: Deploy
 
 on:
   push:
-    branches: [master]
+    branches: [main]
 
   workflow_dispatch:
 
@@ -296,7 +296,7 @@ jobs:
       - name: Setup EC2 Workspace via SSM
         if: steps.resolve.outputs.SKIP_DEPLOY != 'true'
         run: |
-          SOURCE_BRANCH="master"
+          SOURCE_BRANCH="main"
           ENV_ENCODED=$(base64 -w 0 env/liquibase.env)
           GH_TOKEN="${{ secrets.GH_PAT }}"
           SCRIPT=$(cat <<EOF
@@ -468,7 +468,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: master
+          ref: main
           fetch-depth: 0
 
       - name: Configure AWS credentials
@@ -522,7 +522,7 @@ jobs:
 
       - name: Setup EC2 Workspace via SSM
         run: |
-          SOURCE_BRANCH="master"
+          SOURCE_BRANCH="main"
           ENV_ENCODED=$(base64 -w 0 env/liquibase.env)
           GH_TOKEN="${{ secrets.GH_PAT }}"
           SCRIPT=$(cat <<EOF
