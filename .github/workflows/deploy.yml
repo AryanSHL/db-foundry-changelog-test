@@ -123,7 +123,10 @@ jobs:
             SELECTED_REGION="$GH_INPUT_REGION"
             echo "Manual deploy — ENV=$SELECTED_ENV REGION=${SELECTED_REGION:-<none>}"
           else
-            CHANGED=$(git diff --name-only HEAD~1 HEAD)
+            # Rollback trees (dbs/<env>-rollback, dbs/prod/<REGION>-rollback) are never
+            # auto-run, so they must not count towards env/region detection.
+            CHANGED=$(git diff --name-only HEAD~1 HEAD \
+              | grep -vE '^dbs/([^/]+-rollback|prod/[^/]+-rollback)/' || true)
             echo "Changed files:"; echo "$CHANGED"
 
             ENVS=$(echo "$CHANGED" | grep -oP '^dbs/\K[^/]+' | sort -u)

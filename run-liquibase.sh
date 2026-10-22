@@ -9,6 +9,11 @@ set -euo pipefail
 # changelog-master.xml files), this script auto-generates a temporary master
 # changelog per DB using <includeAll> to pick up every script in scripts/.
 #
+# NOTE: this repo now mirrors AM-db-migration-service's layout, so each DB has
+# a committed changelog-master.xml (includeAll path="changeset") next to its
+# changeset/ folder, and Mongo DBs live under "MongoDB/". The runner below uses
+# that committed master instead of generating a temp one.
+#
 # Usage:  run-liquibase.sh <env> <command> [region]
 #   env     : dev | qa | stg | uat | prod
 #   command : validate | update | status | rollbackCount | ...
@@ -97,41 +102,25 @@ fi
 
 getvar() { printf '%s' "${!1-}"; }
 
-# ── Helper: generate a temp changelog-master.xml with includeAll ─────────────
-
-generate_master_changelog() {
-  local scripts_dir="$1"
-  local tmp_master
-  tmp_master=$(mktemp "${scripts_dir}/changelog-master-XXXXXX.xml")
-
-  cat > "$tmp_master" <<'XMLEOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<databaseChangeLog
-    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
-        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
-
-    <includeAll path="." relativeToChangelogFile="true"/>
-</databaseChangeLog>
-XMLEOF
-
-  echo "$tmp_master"
-}
-
 # ── Discover and process databases ───────────────────────────────────────────
 
 PROCESSED=0
 ERRORS=0
 
 process_db() {
-  local db_type="$1"   # sql or mongodb
+  local db_type="$1"   # sql or MongoDB
   local db_name="$2"   # e.g. catalog-db, user-db
   local db_dir="$3"    # full path to the DB directory
-  local scripts_dir="$db_dir/scripts"
+  local scripts_dir="$db_dir/changeset"
+  local master="$db_dir/changelog-master.xml"
 
   if [[ ! -d "$scripts_dir" ]]; then
-    echo "SKIP: No scripts/ directory in $db_dir"
+    echo "SKIP: No changeset/ directory in $db_dir"
+    return
+  fi
+  if [[ ! -f "$master" ]]; then
+    log_error "ERROR: changelog-master.xml not found: $master"
+    ERRORS=$((ERRORS + 1))
     return
   fi
 
@@ -189,12 +178,8 @@ process_db() {
   local runtime_config="$BASE_DIR/configs/${db_name}.runtime.properties"
   envsubst < "$config_template" > "$runtime_config"
 
-  # Generate temporary master changelog
-  local tmp_master
-  tmp_master=$(generate_master_changelog "$scripts_dir")
-
   local changelog_name
-  changelog_name=$(basename "$tmp_master")
+  changelog_name=$(basename "$master")
 
   echo ""
   echo -e "\033[0;32m==========================================================================\033[0m"
@@ -210,7 +195,7 @@ process_db() {
   local CMD=(
     "$LIQUIBASE_BIN"
     "--defaultsFile=$runtime_config"
-    "--searchPath=$scripts_dir"
+    "--searchPath=${db_dir%/}"
     "--changeLogFile=$changelog_name"
     "--log-level=$LOG_LEVEL"
     "$COMMAND"
@@ -228,12 +213,12 @@ process_db() {
   fi
 
   # Cleanup temp files
-  rm -f "$tmp_master" "$runtime_config"
+  rm -f "$runtime_config"
 }
 
-# ── Iterate over sql/ and mongodb/ directories ──────────────────────────────
+# ── Iterate over sql/ and MongoDB/ directories ──────────────────────────────
 
-for db_type_dir in "$DB_BASE"/sql "$DB_BASE"/mongodb; do
+for db_type_dir in "$DB_BASE"/sql "$DB_BASE"/MongoDB; do
   [[ ! -d "$db_type_dir" ]] && continue
 
   db_type=$(basename "$db_type_dir")
@@ -255,5 +240,5 @@ if [[ $ERRORS -gt 0 ]]; then
 fi
 
 if [[ $PROCESSED -eq 0 ]]; then
-  echo "WARNING: No databases were processed. Check that dbs/$ENVIRONMENT/ has sql/ or mongodb/ subdirectories with scripts."
+  echo "WARNING: No databases were processed. Check that dbs/$ENVIRONMENT/ has sql/ or MongoDB/ subdirectories with changeset/ folders."
 fi

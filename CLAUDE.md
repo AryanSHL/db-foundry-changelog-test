@@ -33,27 +33,25 @@ DB Foundry UI  ──push changeset──▶  This Repo (changelog)
 ├── configs/
 │   ├── MySQL.properties        # Connection template for SQL databases
 │   └── MongoDB.properties      # Connection template for MongoDB databases
-├── dbs/                        # Changeset files organized by environment
-│   ├── dev/
-│   │   ├── sql/<db-name>/scripts/*.sql
-│   │   └── mongodb/<db-name>/scripts/*.yaml
-│   ├── qa/
-│   │   ├── sql/<db-name>/scripts/*.sql
-│   │   └── mongodb/<db-name>/scripts/*.yaml
-│   ├── stg/                    # Same structure as dev/qa
-│   ├── uat/                    # Same structure as dev/qa
+├── dbs/                        # Same layout as SHL-India/AM-db-migration-service
+│   ├── dev|qa|stg|uat/
+│   │   ├── sql/<db-name>/
+│   │   │   ├── changelog-master.xml          # includeAll path="changeset" — never edit
+│   │   │   └── changeset/*.sql
+│   │   └── MongoDB/<db-name>/                # note the capital M, D, B
+│   │       ├── changelog-master.xml
+│   │       └── changeset/*.yml
+│   ├── stg-rollback|uat-rollback/            # Rollback changesets, same layout
 │   └── prod/
-│       ├── AU/sql/<db-name>/scripts/   # Region-based for prod
-│       ├── EU/sql/<db-name>/scripts/
-│       ├── US/sql/<db-name>/scripts/
-│       └── CH/sql/<db-name>/scripts/
-├── run-liquibase.sh            # Main runner: discovers DBs, generates temp master, runs liquibase
+│       ├── AU|EU|US|CH/                      # Region-based; same layout as above
+│       └── AU-rollback|EU-rollback|US-rollback|CH-rollback/
+├── run-liquibase.sh            # Main runner: discovers DBs, runs liquibase with each DB's changelog-master.xml
 └── CLAUDE.md                   # This file
 ```
 
 ### Changeset file formats
 
-**SQL** (`dbs/<env>/sql/<db-name>/scripts/V<version>_<jira>_<desc>.sql`):
+**SQL** (`dbs/<env>/sql/<db-name>/changeset/V<version>_<jira>_<desc>.sql`):
 ```sql
 --liquibase formatted sql
 
@@ -63,7 +61,7 @@ DB Foundry UI  ──push changeset──▶  This Repo (changelog)
 ALTER TABLE users ADD COLUMN active BOOLEAN DEFAULT TRUE;
 ```
 
-**MongoDB** (`dbs/<env>/mongodb/<db-name>/scripts/V<version>_<jira>_<desc>.yaml`):
+**MongoDB** (`dbs/<env>/MongoDB/<db-name>/changeset/V<version>_<jira>_<desc>.yml`):
 ```yaml
 databaseChangeLog:
 - changeSet:
@@ -87,7 +85,7 @@ databaseChangeLog:
   - `merge_group` — runs when PR enters the GitHub Merge Queue (pre-merge check)
   - `workflow_dispatch` for manual runs
 - **What it does**: Runs `liquibase validate` to check changeset syntax
-- **Environment detection**: Auto-detects from changed file paths (`dbs/<env>/...`)
+- **Environment detection**: Auto-detects from changed file paths (`dbs/<env>/...`). `*-rollback` folders are ignored for detection (a PR touching only rollback files skips validate)
 - **Constraint**: A single PR must only touch one environment
 - **Posts**: GitHub commit status (`liquibase-validate`) on the PR
 
@@ -154,8 +152,8 @@ passes, auto-merges to `master` (which then triggers the `Deploy` workflow).
 ### `run-liquibase.sh`
 
 The runner script discovers databases automatically:
-1. Scans `dbs/<env>/sql/` and `dbs/<env>/mongodb/` for DB directories
-2. For each DB, generates a temporary `changelog-master.xml` using `<includeAll>` to include all files in `scripts/`
+1. Scans `dbs/<env>/sql/` and `dbs/<env>/MongoDB/` for DB directories (prod: `dbs/prod/<REGION>/...`)
+2. For each DB, uses the committed `changelog-master.xml` (`<includeAll path="changeset"/>`) with `--searchPath` set to the DB folder. Rollback trees (`*-rollback`) are never run by this script
 3. Reads DB credentials from `env/liquibase.env` (env var naming convention: `<DB_NAME_UPPER>_DB_HOST`, `_DB_NAME`, `_DB_USERNAME`, `_DB_PASSWORD`)
 4. Generates a runtime `.properties` file from the config template
 5. Runs the requested liquibase command

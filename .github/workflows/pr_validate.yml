@@ -97,7 +97,10 @@ jobs:
           else
             TARGET="${GH_BASE_REF:-master}"
             git fetch origin "$TARGET"
-            CHANGED=$(git diff --name-only "origin/$TARGET"...HEAD)
+            # Rollback trees (dbs/<env>-rollback, dbs/prod/<REGION>-rollback) are never
+            # auto-run, so they must not count towards env/region detection.
+            CHANGED=$(git diff --name-only "origin/$TARGET"...HEAD \
+              | grep -vE '^dbs/([^/]+-rollback|prod/[^/]+-rollback)/' || true)
             echo "Changed files:"; echo "$CHANGED"
 
             ENVS=$(echo "$CHANGED" | grep -oP '^dbs/\K[^/]+' | sort -u)
